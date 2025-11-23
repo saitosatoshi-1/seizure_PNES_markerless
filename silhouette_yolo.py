@@ -1,51 +1,66 @@
-import cv2, os, argparse
+import cv2, os, numpy as np
 from ultralytics import YOLO
 
-def convert_to_qt_compatible(in_path, out_path):
-    os.system(
-        f"ffmpeg -y -i {in_path} -vcodec libx264 -pix_fmt yuv420p "
-        f"-profile:v baseline -level 3.0 -movflags +faststart {out_path}"
-    )
+# ====== 入力動画 ======
+video_path = '/content/*****.mp4'
+if not os.path.exists(video_path):
+    raise FileNotFoundError(f'動画が見つかりません: {video_path}')
 
-def process_segmentation(input_video, output_video):
-    seg_model = YOLO('yolo11s-seg.pt')
+# ====== モデル ======
+det_model = YOLO('yolo11s.pt')
+seg_model = YOLO('yolo11s-seg.pt')
 
-    cap = cv2.VideoCapture(input_video)
-    if not cap.isOpened():
-        raise RuntimeError(f"VideoCaptureが開けません: {input_video}")
+# ====== 動画オープン ======
+cap = cv2.VideoCapture(video_path)
+if not cap.isOpened():
+    raise RuntimeError('VideoCaptureが開けません')
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+ret, test_frame = cap.read()
+if not ret:
+    raise RuntimeError('最初のフレームを読み込めません')
+cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_video, fourcc, fps, (width, height))
+orig_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+height, width = test_frame.shape[:2]
 
-    frame_idx = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+print(f"fps={orig_fps:.3f}, frames={frame_count}, size={width}x{height}")
 
-        results = seg_model(frame)
-        vis = results[0].plot()
-        out.write(vis)
-        frame_idx += 1
+# ====== 出力設定 ======
+target_fps = min(20.0, orig_fps)
+frame_interval = max(1, int(round(orig_fps / target_fps)))
+out_fps = max(1, int(round(orig_fps / frame_interval)))
 
-    cap.release()
-    out.release()
+out_path_tmp = '/content/FBTCS_tmp.mp4'   # OpenCV出力（互換性低い）
+fourcc = cv2.VideoWriter_fourcc(*'mp4v') # mp4vならまず書ける
+out = cv2.VideoWriter(out_path_tmp, fourcc, out_fps, (width, height))
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input", required=True, help="Input video")
-    parser.add_argument("--output", default="output.mp4", help="Output video")
-    args = parser.parse_args()
+if not out.isOpened():
+    raise RuntimeError('VideoWriterが開けません')
 
-    tmp = "tmp_output.mp4"
-    process_segmentation(args.input, tmp)
 
-    convert_to_qt_compatible(tmp, args.output)
-    print(f"Done. Output saved at: {args.output}")
 
-if __name__ == "__main__":
-    main()
+# ====== ダミー処理ループ（間引きしながらコピー） ======
+frame_idx = 0
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+    if frame_idx % frame_interval == 0:
+        out.write(frame)
+    frame_idx += 1
+
+cap.release()
+out.release()
+
+print("OpenCVで一旦 mp4v 出力完了:", out_path_tmp)
+
+
+
+
+# ====== ffmpegでQuickTime互換に再エンコード ======
+out_path_qt = '/content/FBTCS_silhouette_qt.mp4'
+os.system(f"ffmpeg -y -i {out_path_tmp} -vcodec libx264 -pix_fmt yuv420p "
+          f"-profile:v baseline -level 3.0 -movflags +faststart {out_path_qt}")
+
+print("QuickTime互換ファイル出力:", out_path_qt)
