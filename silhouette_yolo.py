@@ -6,6 +6,7 @@ motion analysis (skeleton, silhouette, optical flow).
 """
 
 import cv2, os
+from ultralytics import YOLO
 
 video_path = '/content/****.mp4'
 
