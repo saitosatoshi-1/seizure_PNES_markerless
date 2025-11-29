@@ -1,3 +1,10 @@
+"""
+This script performs video preprocessing only: frame-rate downsampling and
+re-encoding. No human detection, segmentation, or keypoint estimation is done
+at this stage. The goal is to generate a stable, lightweight, and
+QuickTime-compatible video before running skeletal or silhouette analysis.
+"""
+
 import cv2, os, numpy as np
 from ultralytics import YOLO
 
@@ -5,10 +12,6 @@ from ultralytics import YOLO
 video_path = '/content/*****.mp4'
 if not os.path.exists(video_path):
     raise FileNotFoundError(f'Video not found: {video_path}')
-
-# ====== YOLO models ======
-det_model = YOLO('yolo11s.pt')       # keypoint detection
-seg_model = YOLO('yolo11s-seg.pt')   # human segmentation
 
 # ====== Open video ======
 cap = cv2.VideoCapture(video_path)
