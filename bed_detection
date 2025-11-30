@@ -6,28 +6,20 @@ from ultralytics import YOLO
 
 
 # ================== 入力・出力 ==================
-video_path = '/content/FBTCS_silhouette_qt.mp4'
+video_path = '/content/****_silhouette_qt.mp4'
 png_dir = Path('/content/bed_best_frames'); png_dir.mkdir(parents=True, exist_ok=True)
-out_try_path = '/content/FBTCS_silhouette.mp4'
-out_qt_path  = '/content/FBTCS_silhouette_qt_seg.mp4'
+out_try_path = '/content/****_silhouette.mp4'
+out_qt_path  = '/content/****_silhouette_qt_seg.mp4'
 best_json    = '/content/bed_best.json'
 best_csv     = '/content/bed_best.csv'
 final_png    = '/content/bed_best_final.png'
 
-
-# ================== モデル ==================
-# 人物シルエット（既存の seg_model を使う前提。未定義ならこの1行で仮にCOCOセグを使う）
-try:
-    seg_model
-except NameError:
-    seg_model = YOLO('yolo11s-seg.pt')   # 人物セグ用の仮モデル（必要なら置換）
-
-# bed検出（セグ優先、無ければbbox）
-# どちらも用意しておく（あってもOK、無ければ自動ダウンロード）
+seg_model = YOLO('yolo11s-seg.pt')  
 seg_bed_model = YOLO('yolo11s-seg.pt')
 det_model     = YOLO('yolo11s.pt')
 
-# bedクラスID（名前から引く：環境差吸収）
+
+# ==============bedクラスID=========================
 def get_cls_id_by_name(model, name='bed'):
     for i, n in model.names.items():
         if n == name:
@@ -56,7 +48,7 @@ if not out.isOpened():
     raise RuntimeError('VideoWriterが開けません')
 
 
-# ================== ベスト保持 ==================
+# ====== 動画の中から最も信頼度の高いベッドを特定 ==================
 best_bed = {
     'frame': None, 'conf': -1.0,
     'x1': None, 'y1': None, 'x2': None, 'y2': None,
@@ -64,12 +56,15 @@ best_bed = {
     'area_mask_px': None, 'area_mask_ratio': None,
     'area_rot_rect_px': None, 'area_bbox_px': None
 }
-
-
-
+''''
+信頼度（conf）
+座標（x1,y1,x2,y2）
+中心（cx,cy）
+幅 w, 高さ h
+mask 面積などの shape 情報
+''''
 
 def update_best_from_seg(res, frame_idx, vis_w, vis_h):
-    """セグ結果からbest更新。成功なら(True, vis_for_overlay, updated_bbox_dict)、失敗なら(False, None, None)"""
     if res.masks is None or len(res.masks.data) == 0:
         return False, None, None
     confs = res.boxes.conf.cpu().numpy()
