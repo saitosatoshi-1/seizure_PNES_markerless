@@ -1,71 +1,86 @@
-# ====== Gate setup: ベッド周囲ゲート生成（縮小マージン対応、安全版） ======
-# 目的：
-#   - bed_best.json のベッド位置をもとに、乗り移り防止のための Gate 領域を生成
-#   - ゲートを縮小（負マージン）で調整可能
-#   - PNG で位置確認し、下流（person1選定・silhouette解析）へ JSON で受け渡す
+"""
+build_gate.py
+Generate a safety gate polygon around the detected bed region.
 
-import json, math, cv2, numpy as np
+Input:
+    bed_best.json  – best bed detection (from YOLO)
+Output:
+    gate_config.json
+    gate_preview.png
+
+"""
+
+import json
+import cv2
+import numpy as np
 from pathlib import Path
 
-# ---- 既存の best_bed を利用 ----
-best_json = '/content/bed_best.json'
-with open(best_json, 'r') as f:
-    best_bed = json.load(f)
 
-if best_bed.get('frame') is None or best_bed.get('conf', -1) <= 0:
-    raise RuntimeError('best_bed が未確定です')
+# ===============================
+# Load best_bed information
+# ===============================
+best_json = Path("bed_best.json")
+if not best_json.exists():
+    raise FileNotFoundError("bed_best.json not found")
 
-best_frame_idx = int(best_bed['frame'])
-bed_cx, bed_cy = float(best_bed['cx']), float(best_bed['cy'])
-bx1, by1, bx2, by2 = map(lambda v: float(v), [best_bed['x1'], best_bed['y1'], best_bed['x2'], best_bed['y2']])
+best_bed = json.load(open(best_json))
 
-# ---- ゲートのマージン設定（負値 = 縮小 / 正値 = 拡張）----
+if best_bed.get("frame") is None or best_bed.get("conf", -1) <= 0:
+    raise RuntimeError("Invalid best_bed.json")
+
+
+# ===============================
+# Gate margin configuration
+# (positive = expand, negative = shrink)
+# ===============================
 MARGINS = {
-    "left":   -10,   # 左方向に10px縮小
-    "right":  -40,   # 右方向に40px縮小
-    "top":     30,   # 上方向に30px拡張
-    "bottom":   0,   # 下方向は変更なし
-    # 斜め方向（正=外へ拡張, 負=内へ縮小）
+    "left":   -10,
+    "right":  -40,
+    "top":     30,
+    "bottom":   0,
     "diag_nw":  0,
     "diag_ne":  0,
     "diag_sw":  0,
-    "diag_se":  0
+    "diag_se":  0,
 }
 
+
+# ===============================
+# Gate polygon builder
+# ===============================
 def build_gate_polygon_safe(bed_xyxy, margins, W, H, eps=1.0):
     """
-    margins: 正=外へ拡張、負=内へ縮小（px）
-    bed_xyxy: [x1,y1,x2,y2]
-    W,H: 画像サイズ
+    Safe polygon expansion/shrink around bounding box.
+    bed_xyxy : [x1,y1,x2,y2]
+    W,H      : image width/height
     """
     x1, y1, x2, y2 = map(float, bed_xyxy)
-    w = max(0.0, x2 - x1); h = max(0.0, y2 - y1)
+    w = max(0, x2 - x1)
+    h = max(0, y2 - y1)
 
-    # 縮小し過ぎ防止（ゲートが消失しないように制限）
-    max_shrink_x = max(0.0, (w - 2*eps) / 2.0)
-    max_shrink_y = max(0.0, (h - 2*eps) / 2.0)
+    # maximum allowable shrink
+    max_sx = max(0, (w - 2*eps) / 2)
+    max_sy = max(0, (h - 2*eps) / 2)
 
-    def clamp_lr(v):  # 左右
-        return max(-max_shrink_x, v) if v < 0 else v
-    def clamp_tb(v):  # 上下
-        return max(-max_shrink_y, v) if v < 0 else v
+    def clamp_x(v): return max(-max_sx, v) if v < 0 else v
+    def clamp_y(v): return max(-max_sy, v) if v < 0 else v
 
-    left   = clamp_lr(float(margins["left"]))
-    right  = clamp_lr(float(margins["right"]))
-    top    = clamp_tb(float(margins["top"]))
-    bottom = clamp_tb(float(margins["bottom"]))
+    left   = clamp_x(margins["left"])
+    right  = clamp_x(margins["right"])
+    top    = clamp_y(margins["top"])
+    bottom = clamp_y(margins["bottom"])
 
-    # 基本の拡張・縮小（正なら外へ、負なら内へ）
+    # base rectangle
     X1 = x1 - left
     Y1 = y1 - top
     X2 = x2 + right
     Y2 = y2 + bottom
 
-    # 斜め拡張（正=外、負=内）
-    dnw = float(margins.get("diag_nw", 0.0))
-    dne = float(margins.get("diag_ne", 0.0))
-    dsw = float(margins.get("diag_sw", 0.0))
-    dse = float(margins.get("diag_se", 0.0))
+    # diagonal margins
+    dnw = margins.get("diag_nw", 0)
+    dne = margins.get("diag_ne", 0)
+    dsw = margins.get("diag_sw", 0)
+    dse = margins.get("diag_se", 0)
 
     pts = np.array([
         [X1, Y1], [X2, Y1], [X2, Y2], [X1, Y2],
@@ -75,64 +90,58 @@ def build_gate_polygon_safe(bed_xyxy, margins, W, H, eps=1.0):
         [X2 + dse, Y2 + dse],
     ], dtype=np.float32).reshape(-1,1,2)
 
-    hull = cv2.convexHull(pts)  # (N,1,2)
-    # 画像外に出ないようにクリップ
+    hull = cv2.convexHull(pts)
     hull[...,0] = np.clip(hull[...,0], 0, W-1)
     hull[...,1] = np.clip(hull[...,1], 0, H-1)
-    return hull
+    return hull.reshape(-1,2)
 
-# ---- プレビュー用に best_frame を読み込む ----
-video_path = '/content/FBTCS_silhouette_qt.mp4'
+
+# ===============================
+# Preview frame
+# ===============================
+video_path = "input_video.mp4"
 cap = cv2.VideoCapture(video_path)
-if not cap.isOpened():
-    raise RuntimeError(f'VideoCaptureが開けません: {video_path}')
-cap.set(cv2.CAP_PROP_POS_FRAMES, best_frame_idx)
+cap.set(cv2.CAP_PROP_POS_FRAMES, int(best_bed["frame"]))
 ret, frame = cap.read()
 cap.release()
 if not ret:
-    raise RuntimeError(f'best_frame_idx={best_frame_idx} の読み出しに失敗')
+    raise RuntimeError("Failed to read preview frame")
 
-vis = frame.copy()
-H, W = vis.shape[:2]
+H, W = frame.shape[:2]
 
-# ---- ゲートポリゴン生成 ----
-bed_xyxy = np.array([bx1, by1, bx2, by2], dtype=float)
+# ===============================
+# Build gate polygon
+# ===============================
+bed_xyxy = [best_bed["x1"], best_bed["y1"],
+            best_bed["x2"], best_bed["y2"]]
+
 gate_poly = build_gate_polygon_safe(bed_xyxy, MARGINS, W, H)
-gate_points = gate_poly.reshape(-1,2).tolist()
+gate_points = gate_poly.tolist()
 
-# ---- プレビュー描画 ----
-cv2.rectangle(vis, (int(round(bx1)), int(round(by1))),
-                     (int(round(bx2)), int(round(by2))), (0,255,0), 2)
-cv2.circle(vis, (int(round(bed_cx)), int(round(bed_cy))), 5, (0,255,0), -1)
-cv2.putText(vis, f"bed conf={best_bed['conf']:.2f}",
-            (int(round(bx1)), max(0, int(round(by1))-10)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2, cv2.LINE_AA)
 
-# 半透明塗りでゲートを確認しやすく
+# ===============================
+# Draw preview
+# ===============================
+vis = frame.copy()
 overlay = vis.copy()
-cv2.fillPoly(overlay, [np.array(gate_points, dtype=np.int32)], (0,180,0))
+
+cv2.fillPoly(overlay, [gate_poly.astype(np.int32)], (0,180,0))
 vis = cv2.addWeighted(overlay, 0.25, vis, 0.75, 0)
-cv2.polylines(vis, [np.array(gate_points, dtype=np.int32)], True, (0,180,0), 2)
+cv2.polylines(vis, [gate_poly.astype(np.int32)], True, (0,180,0), 2)
 
-# ---- 保存 ----
-gate_png = '/content/gate_preview.png'
-ok = cv2.imwrite(gate_png, vis)
+cv2.imwrite("gate_preview.png", vis)
 
-# 下流セルへ渡す JSON 出力
-gate_json = '/content/gate_config.json'
+
+# ===============================
+# Save JSON
+# ===============================
 payload = {
-    "bed_xyxy": [bx1, by1, bx2, by2],
-    "bed_cxcy": [bed_cx, bed_cy],
-    "best_frame": best_frame_idx,
+    "bed_xyxy": bed_xyxy,
+    "best_frame": int(best_bed["frame"]),
     "margins": MARGINS,
-    "gate_polygon": gate_points  # [[x,y], ...]
+    "gate_polygon": gate_points
 }
-with open(gate_json, 'w') as f:
-    json.dump(payload, f, indent=2)
 
-# ---- ログ出力 ----
-print(f"[Gate] best_frame={best_frame_idx}  size={W}x{H}")
-print(f"[Gate] bed_xyxy=({bx1:.1f},{by1:.1f},{bx2:.1f},{by2:.1f})  bed_cxcy=({bed_cx:.1f},{bed_cy:.1f})")
-print(f"[Gate] margins={MARGINS}")
-print(f"PNG:  {gate_png}  saved={ok}")
-print(f"JSON: {gate_json}")
+json.dump(payload, open("gate_config.json", "w"), indent=2)
+
+print("Gate configuration saved.")
