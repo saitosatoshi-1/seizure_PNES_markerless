@@ -1,87 +1,61 @@
-import os, json, csv
+"""
+Bed Region Best-Frame Detection using YOLO (Ultralytics)
+--------------------------------------------------------
+- Detect bed region in video using segmentation (preferred) and detection (fallback).
+- Save best-confidence bed frame as PNG.
+- Save JSON/CSV metadata.
+- Save visualization video.
+
+Model files required:
+    models/yolo11s.pt
+    models/yolo11s-seg.pt
+"""
+
+import os
+import json
+import csv
+import argparse
 from pathlib import Path
 import cv2
 import numpy as np
 from ultralytics import YOLO
 
 
-# ================== 入力・出力 ==================
-video_path = '/content/****_silhouette_qt.mp4'
-png_dir = Path('/content/bed_best_frames'); png_dir.mkdir(parents=True, exist_ok=True)
-out_try_path = '/content/****_silhouette.mp4'
-out_qt_path  = '/content/****_silhouette_qt_seg.mp4'
-best_json    = '/content/bed_best.json'
-best_csv     = '/content/bed_best.csv'
-final_png    = '/content/bed_best_final.png'
-
-seg_model = YOLO('yolo11s-seg.pt')  
-seg_bed_model = YOLO('yolo11s-seg.pt')
-det_model     = YOLO('yolo11s.pt')
-
-
-# ==============bedクラスID=========================
-def get_cls_id_by_name(model, name='bed'):
+# ------------------------------------------------------------
+# Utility: Get class ID from YOLO model by name (e.g., "bed")
+# ------------------------------------------------------------
+def get_cls_id_by_name(model, name="bed"):
     for i, n in model.names.items():
         if n == name:
             return i
     return None
 
-bed_cls_id_seg = get_cls_id_by_name(seg_bed_model, 'bed')
-bed_cls_id_det = get_cls_id_by_name(det_model, 'bed')
-if bed_cls_id_seg is None and bed_cls_id_det is None:
-    raise RuntimeError('モデルのnamesから bed クラスが見つかりません')
 
-
-# ================== 動画IO ==================
-cap = cv2.VideoCapture(video_path)
-if not cap.isOpened():
-    raise RuntimeError(f'VideoCaptureが開けません: {video_path}')
-
-orig_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-in_w  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-in_h  = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-frame_size = (in_w, in_h)
-
-fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-out = cv2.VideoWriter(out_try_path, fourcc, orig_fps, frame_size)
-if not out.isOpened():
-    raise RuntimeError('VideoWriterが開けません')
-
-
-# ====== 動画の中から最も信頼度の高いベッドを特定 ==================
-best_bed = {
-    'frame': None, 'conf': -1.0,
-    'x1': None, 'y1': None, 'x2': None, 'y2': None,
-    'cx': None, 'cy': None, 'w': None, 'h': None,
-    'area_mask_px': None, 'area_mask_ratio': None,
-    'area_rot_rect_px': None, 'area_bbox_px': None
-}
-''''
-信頼度（conf）
-座標（x1,y1,x2,y2）
-中心（cx,cy）
-幅 w, 高さ h
-mask 面積などの shape 情報
-''''
-
+# ------------------------------------------------------------
+# Segmentation-based update
+# ------------------------------------------------------------
 def update_best_from_seg(res, frame_idx, vis_w, vis_h):
     if res.masks is None or len(res.masks.data) == 0:
         return False, None, None
+
     confs = res.boxes.conf.cpu().numpy()
     xyxy  = res.boxes.xyxy.cpu().numpy()
     masks = res.masks.data.cpu().numpy()
 
     k = int(np.argmax(confs))
     conf = float(confs[k])
-    x1, y1, x2, y2 = map(float, xyxy[k])
-    w = x2 - x1; h = y2 - y1
 
+    x1, y1, x2, y2 = map(float, xyxy[k])
+    w = x2 - x1
+    h = y2 - y1
+
+    # mask → uint8
     m = masks[k]
     mask_uint8 = (m > 0.5).astype(np.uint8)
     area_mask_px = int(mask_uint8.sum())
     area_mask_ratio = area_mask_px / float(vis_w * vis_h)
 
-    # 回転最小矩形面積
+    # rotated min-area rectangle
     cnts, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     area_rot_rect_px = None
     if cnts:
@@ -92,161 +66,251 @@ def update_best_from_seg(res, frame_idx, vis_w, vis_h):
     area_bbox_px = float(max(0.0, w) * max(0.0, h))
 
     upd = {
-        'frame': frame_idx, 'conf': conf,
-        'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2,
-        'cx': x1 + w/2.0, 'cy': y1 + h/2.0, 'w': w, 'h': h,
-        'area_mask_px': area_mask_px,
-        'area_mask_ratio': area_mask_ratio,
-        'area_rot_rect_px': area_rot_rect_px,
-        'area_bbox_px': area_bbox_px
+        "frame": frame_idx,
+        "conf": conf,
+        "x1": x1,
+        "y1": y1,
+        "x2": x2,
+        "y2": y2,
+        "cx": x1 + w/2.0,
+        "cy": y1 + h/2.0,
+        "w": w,
+        "h": h,
+        "area_mask_px": area_mask_px,
+        "area_mask_ratio": area_mask_ratio,
+        "area_rot_rect_px": area_rot_rect_px,
+        "area_bbox_px": area_bbox_px,
     }
     return True, mask_uint8, upd
 
 
-
-
+# ------------------------------------------------------------
+# Detection-based fallback update
+# ------------------------------------------------------------
 def update_best_from_det(res, frame_idx):
     if res.boxes is None or len(res.boxes) == 0:
         return False, None
+
     confs = res.boxes.conf.cpu().numpy()
     xyxy  = res.boxes.xyxy.cpu().numpy()
+
     k = int(np.argmax(confs))
     conf = float(confs[k])
+
     x1, y1, x2, y2 = map(float, xyxy[k])
-    w = x2 - x1; h = y2 - y1
+    w = x2 - x1
+    h = y2 - y1
+
     area_bbox_px = float(max(0.0, w) * max(0.0, h))
+
     upd = {
-        'frame': frame_idx, 'conf': conf,
-        'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2,
-        'cx': x1 + w/2.0, 'cy': y1 + h/2.0, 'w': w, 'h': h,
-        'area_mask_px': None,
-        'area_mask_ratio': None,
-        'area_rot_rect_px': None,
-        'area_bbox_px': area_bbox_px
+        "frame": frame_idx,
+        "conf": conf,
+        "x1": x1,
+        "y1": y1,
+        "x2": x2,
+        "y2": y2,
+        "cx": x1 + w/2.0,
+        "cy": y1 + h/2.0,
+        "w": w,
+        "h": h,
+        "area_mask_px": None,
+        "area_mask_ratio": None,
+        "area_rot_rect_px": None,
+        "area_bbox_px": area_bbox_px,
     }
     return True, upd
 
 
+# ------------------------------------------------------------
+# Main
+# 1.	人物シルエット（人）を可視化
+# 2.	bed segmentation → detection の順に試して更新
+# 3.	best_bed（最も conf が高い検出結果）を更新
+# 4.	更新があれば PNG として保存
+# 5.	心拍PNG（進捗）も保存
+# 6.	可視化フレームを書き出す
+# → 毎フレーム YOLO を回し、
+# → ベッド領域の“ベストショット”を自動的に抽出する。
+# ------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(description="Bed Best-Frame Detector")
+    parser.add_argument("--video", required=True, help="Input video path")
+    parser.add_argument("--outdir", default="outputs", help="Output directory")
+    args = parser.parse_args()
 
+    video_path = args.video
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
 
-# ================== ループ ==================
-frame_idx = 0
-best_png_img = None
-saved_updates = 0
-heartbeat_every = 90  # 90フレームごと(約3秒に1回)心拍PNG
+    # model load
+    seg_model = YOLO("models/yolo11s-seg.pt")
+    seg_bed_model = YOLO("models/yolo11s-seg.pt")
+    det_model = YOLO("models/yolo11s.pt")
 
+    bed_cls_id_seg = get_cls_id_by_name(seg_bed_model, "bed")
+    bed_cls_id_det = get_cls_id_by_name(det_model, "bed")
+    if bed_cls_id_seg is None and bed_cls_id_det is None:
+        raise RuntimeError("Model does not contain class 'bed'.")
 
-while True:
-    ret, frame = cap.read()   #フレームを1枚ずつ読み込む
-    if not ret:
-        break
+    # video IO
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video: {video_path}")
 
+    orig_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    in_w  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    in_h  = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    frame_size = (in_w, in_h)
 
-    # 人物シルエット可視化
-    seg_people = seg_model(frame) # 人物セグメンテーション
-    vis = seg_people[0].plot()    # 検出結果を画像化
+    out_try_path = str(outdir / "output_raw.mp4")
+    out_qt_path  = str(outdir / "output_qt.mp4")
+    best_json    = str(outdir / "best_bed.json")
+    best_csv     = str(outdir / "best_bed.csv")
+    final_png    = str(outdir / "best_bed.png")
+    png_dir      = outdir / "best_frames"
+    png_dir.mkdir(exist_ok=True)
 
-    vis_h, vis_w = vis.shape[:2]
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out = cv2.VideoWriter(out_try_path, fourcc, orig_fps, frame_size)
+    if not out.isOpened():
+        raise RuntimeError("VideoWriter cannot open.")
 
+    best_bed = {
+        "frame": None,
+        "conf": -1.0,
+        "x1": None,
+        "y1": None,
+        "x2": None,
+        "y2": None,
+        "cx": None,
+        "cy": None,
+        "w": None,
+        "h": None,
+        "area_mask_px": None,
+        "area_mask_ratio": None,
+        "area_rot_rect_px": None,
+        "area_bbox_px": None,
+    }
 
-    # VideoWriterサイズチェック：不一致ならリサイズして合わせる
-    if (vis_w, vis_h) != frame_size:
-        vis = cv2.resize(vis, frame_size, interpolation=cv2.INTER_LINEAR)
-        vis_h, vis_w = frame_size[1], frame_size[0]
+    frame_idx = 0
+    best_png_img = None
+    saved_updates = 0
+    heartbeat_every = 90
 
-    updated = False
+    # --------------------------------------------------
+    # Loop
+    # --------------------------------------------------
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
 
+        seg_people = seg_model(frame)
+        vis = seg_people[0].plot()
+        vis_h, vis_w = vis.shape[:2]
 
-    # 1) bedセグで更新を試みる, ベッド領域の検出 (セグメンテーション優先)
-    if bed_cls_id_seg is not None:
-        res_seg = seg_bed_model.predict(frame, classes=[bed_cls_id_seg], verbose=False)[0]
-        ok, mask_uint8, upd = update_best_from_seg(res_seg, frame_idx, vis_w, vis_h)
-        if ok and upd['conf'] > best_bed['conf']:
-            best_bed.update(upd); updated = True
+        if (vis_w, vis_h) != frame_size:
+            vis = cv2.resize(vis, frame_size)
+            vis_h, vis_w = frame_size[1], frame_size[0]
 
-            # 半透明オーバレイ
-            overlay = vis.copy()
-            overlay[mask_uint8.astype(bool)] = (
-                0.6*overlay[mask_uint8.astype(bool)] + 0.4*np.array((0,255,0))
-            ).astype(np.uint8)
-            vis = cv2.addWeighted(overlay, 1.0, vis, 0.0, 0)
+        updated = False
 
-    # 2) セグで更新されなければ物体検出 bbox で補完
-    if not updated and bed_cls_id_det is not None:
-        res_det = det_model.predict(frame, classes=[bed_cls_id_det], verbose=False)[0]
-        ok, upd = update_best_from_det(res_det, frame_idx)
-        if ok and upd['conf'] > best_bed['conf']:
-            best_bed.update(upd); updated = True
+        # segmentation preferred
+        if bed_cls_id_seg is not None:
+            res_seg = seg_bed_model.predict(frame, classes=[bed_cls_id_seg], verbose=False)[0]
+            ok, mask_uint8, upd = update_best_from_seg(res_seg, frame_idx, vis_w, vis_h)
+            if ok and upd["conf"] > best_bed["conf"]:
+                best_bed.update(upd)
+                updated = True
 
-    # best枠を描画（あるなら）
-    if best_bed['conf'] > 0:
-        bx1, by1 = int(best_bed['x1']), int(best_bed['y1'])
-        bx2, by2 = int(best_bed['x2']), int(best_bed['y2'])
-        cv2.rectangle(vis, (bx1, by1), (bx2, by2), (0,255,0), 2)
-        cv2.putText(vis, f"best bed conf={best_bed['conf']:.2f}",
-                    (bx1, max(0, by1-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2, cv2.LINE_AA)
+                overlay = vis.copy()
+                overlay[mask_uint8.astype(bool)] = (
+                    0.6 * overlay[mask_uint8.astype(bool)] + 0.4 * np.array((0, 255, 0))
+                ).astype(np.uint8)
+                vis = cv2.addWeighted(overlay, 1.0, vis, 0.0, 0)
 
+        # detection fallback
+        if not updated and bed_cls_id_det is not None:
+            res_det = det_model.predict(frame, classes=[bed_cls_id_det], verbose=False)[0]
+            ok, upd = update_best_from_det(res_det, frame_idx)
+            if ok and upd["conf"] > best_bed["conf"]:
+                best_bed.update(upd)
+                updated = True
 
-    #新しいbest bedを見つけたら保存
-    # ーーー 更新時：PNG保存 & 座標をコンソール出力 ーーー
-    if updated:
-        png_path = png_dir / f"bed_best_frame{frame_idx:06d}.png"
-        ok = cv2.imwrite(str(png_path), vis)
-        best_png_img = vis.copy() if ok else best_png_img
-        saved_updates += 1
-        print(
-            f"[Update] frame={best_bed['frame']} conf={best_bed['conf']:.4f} "
-            f"xyxy=({best_bed['x1']:.1f},{best_bed['y1']:.1f},{best_bed['x2']:.1f},{best_bed['y2']:.1f}) "
-            f"cxcy=({best_bed['cx']:.1f},{best_bed['cy']:.1f}) wh=({best_bed['w']:.1f},{best_bed['h']:.1f}) "
-            f"area_mask_px={best_bed['area_mask_px']} area_rot_rect_px={best_bed['area_rot_rect_px']} "
-            f"area_bbox_px={best_bed['area_bbox_px']} area_mask_ratio={best_bed['area_mask_ratio']}"
+        # draw best
+        if best_bed["conf"] > 0:
+            bx1, by1 = int(best_bed["x1"]), int(best_bed["y1"])
+            bx2, by2 = int(best_bed["x2"]), int(best_bed["y2"])
+            cv2.rectangle(vis, (bx1, by1), (bx2, by2), (0, 255, 0), 2)
+            cv2.putText(
+                vis,
+                f"best bed conf={best_bed['conf']:.2f}",
+                (bx1, max(0, by1 - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 0),
+                2,
+            )
+
+        # save update
+        if updated:
+            png_path = png_dir / f"bed_best_frame{frame_idx:06d}.png"
+            ok = cv2.imwrite(str(png_path), vis)
+            if ok:
+                best_png_img = vis.copy()
+            saved_updates += 1
+            print(f"[Update] frame={best_bed['frame']} conf={best_bed['conf']:.4f}")
+
+        # heartbeat
+        if frame_idx % heartbeat_every == 0:
+            hb_path = png_dir / f"heartbeat_{frame_idx:06d}.png"
+            cv2.imwrite(str(hb_path), vis)
+
+        out.write(vis)
+        frame_idx += 1
+
+    cap.release()
+    out.release()
+
+    # ffmpeg convert
+    os.system(
+        f"ffmpeg -y -i {out_try_path} -vcodec libx264 -pix_fmt yuv420p "
+        f"-profile:v baseline -level 3.0 -movflags +faststart {out_qt_path}"
+    )
+
+    # save best PNG
+    if best_png_img is not None:
+        cv2.imwrite(final_png, best_png_img)
+
+    # save JSON
+    with open(best_json, "w") as f:
+        json.dump(best_bed, f, indent=2)
+
+    # save CSV
+    with open(best_csv, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "frame",
+                "conf",
+                "x1",
+                "y1",
+                "x2",
+                "y2",
+                "cx",
+                "cy",
+                "w",
+                "h",
+                "area_mask_px",
+                "area_mask_ratio",
+                "area_rot_rect_px",
+                "area_bbox_px",
+            ],
         )
+        writer.writeheader()
+        writer.writerow(best_bed)
 
 
-    # ーーー 心拍PNG（進捗確認用） ーーー
-    if frame_idx % heartbeat_every == 0:
-        hb_path = png_dir / f"heartbeat_{frame_idx:06d}.png"
-        cv2.imwrite(str(hb_path), vis)
-
-
-    # 動画フレーム書き込み（必ず frame_size と一致させた vis を渡す）
-    out.write(vis)
-    frame_idx += 1
-
-
-cap.release(); out.release()
-print(f"[Info] Processed frames: {frame_idx}, update-saves: {saved_updates}")
-
-
-# QuickTime互換エンコード
-os.system(f"ffmpeg -y -i {out_try_path} -vcodec libx264 -pix_fmt yuv420p "
-          f"-profile:v baseline -level 3.0 -movflags +faststart {out_qt_path}")
-print("[Info] QuickTime互換:", out_qt_path)
-
-
-
-# ベストPNGの最終保存（見つかった場合のみ）
-if best_png_img is not None:
-    cv2.imwrite(final_png, best_png_img)
-    print("[Final] 最終ベストPNG:", final_png)
-else:
-    print("[Warn] 最終ベストPNGはありません（bed未検出の可能性）")
-
-
-
-# JSON/CSV保存
-with open(best_json, 'w') as f:
-    json.dump(best_bed, f, indent=2)
-with open(best_csv, 'w', newline='') as f:
-    writer = csv.DictWriter(f, fieldnames=['frame','conf','x1','y1','x2','y2','cx','cy','w','h',
-                                           'area_mask_px','area_mask_ratio','area_rot_rect_px','area_bbox_px'])
-    writer.writeheader(); writer.writerow(best_bed)
-print("[Info] 保存:", best_json, best_csv)
-
-
-
-# ディレクトリの中身をざっと報告
-png_files = sorted([p for p in png_dir.glob('*.png')])
-print(f"[Info] PNG saved: {len(png_files)} files")
-if png_files:
-    print(f"[Info] last PNG: {png_files[-1]}")
+if __name__ == "__main__":
+    main()
