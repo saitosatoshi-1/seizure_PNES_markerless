@@ -122,17 +122,19 @@ def update_best_from_det(res, frame_idx):
     return True, upd
 
 
+
 # ------------------------------------------------------------
-# Main
-# 1.	人物シルエット（人）を可視化
-# 2.	bed segmentation → detection の順に試して更新
-# 3.	best_bed（最も conf が高い検出結果）を更新
-# 4.	更新があれば PNG として保存
-# 5.	心拍PNG（進捗）も保存
-# 6.	可視化フレームを書き出す
-# → 毎フレーム YOLO を回し、
-# → ベッド領域の“ベストショット”を自動的に抽出する。
+# Main workflow:
+# 1. Visualize the human silhouette (person class)
+# 2. Try bed segmentation → then bed detection, updating results
+# 3. Update best_bed (the detection with the highest confidence)
+# 4. Save a PNG snapshot whenever best_bed is updated
+# 5. Save progress snapshots (heartbeat PNG) as well
+# 6. Write out the visualization frames
+# → YOLO runs on every frame,
+# → automatically extracting the “best shot” of the bed region.
 # ------------------------------------------------------------
+
 def main():
     parser = argparse.ArgumentParser(description="Bed Best-Frame Detector")
     parser.add_argument("--video", required=True, help="Input video path")
