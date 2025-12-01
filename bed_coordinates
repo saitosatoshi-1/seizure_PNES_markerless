@@ -62,8 +62,17 @@ def build_gate_polygon_safe(bed_xyxy, margins, W, H, eps=1.0):
     max_sx = max(0, (w - 2*eps) / 2)
     max_sy = max(0, (h - 2*eps) / 2)
 
-    def clamp_x(v): return max(-max_sx, v) if v < 0 else v
-    def clamp_y(v): return max(-max_sy, v) if v < 0 else v
+    def clamp_x(v, max_sx):
+        if v < 0:
+            return max(v, -max_sx)
+        else:
+            return v
+
+    def clamp_y(v, max_sy):
+        if v < 0:
+            return max(v, -max_sy)
+        else:
+            return v
 
     left   = clamp_x(margins["left"])
     right  = clamp_x(margins["right"])
