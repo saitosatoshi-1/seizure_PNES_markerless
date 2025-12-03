@@ -1,5 +1,5 @@
 # ==========================================================
-# Person1 Tracking + Pose Estimation + NPZ Export (No CSV)
+# Person1 Tracking + Pose Estimation + NPZ Export
 # ==========================================================
 # This script performs the full person-selection and pose-estimation pipeline.
 # 1. Loads bed metadata (best frame, bounding box, gate polygon)
