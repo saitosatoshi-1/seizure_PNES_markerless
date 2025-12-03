@@ -1,5 +1,4 @@
 # ==========================================================
-# Keypoint Cleaning Pipeline
 # Input  : person1_lock_track.npz  (raw keypoints)
 # Output : person1_clean_kpts.npz (cleaned keypoints)
 #          person1_clean_flags.json
@@ -27,7 +26,7 @@ from scipy.ndimage import uniform_filter1d
 # I/O Paths
 # ===============================
 npz_in       = "/content/person1_lock_track.npz"  # ← upper-stream NPZ (no CSV)
-npz_out      = "/content/person1_clean_kpts.npz"
+cleaned_npz  = "/content/person1_clean_kpts.npz"
 flags_json   = "/content/person1_clean_flags.json"
 report_json  = "/content/person1_clean_report.json"
 best_json    = "/content/bed_best.json"           # optional metadata (missing segments)
@@ -264,7 +263,7 @@ np.savez(
     ref_part=ref_part,
     note_method=note_method
 )
-print("[OK] Saved cleaned NPZ:", npz_out)
+print("[OK] Saved cleaned NPZ:", cleaned_npz)
 
 # ===============================
 # Save flags.json
@@ -299,11 +298,31 @@ with open(report_json, "w") as f:
 print("[OK] Report JSON:", report_json)
 
 
+
+
 # ==========================================================
 # Overlay video generation
 # ==========================================================
 
-# Missing segments (optional)
+# -----------------------
+# Load cleaned npz
+# -----------------------
+data = np.load(cleaned_npz, allow_pickle=True)
+
+time_all = data["time_all"]
+fps      = float(data["fps"])
+
+nose = data["nose"]
+LS   = data["LS"]
+RS   = data["RS"]
+LH   = data["LH"]
+RH   = data["RH"]
+
+N = len(time_all)
+
+# -----------------------
+# Load missing segments (tracking-level)
+# -----------------------
 missing_segments = []
 if os.path.exists(best_json):
     try:
@@ -318,14 +337,25 @@ for s, e in missing_segments:
     if 0 <= s < N and 0 <= e < N:
         missing_mask[s:e+1] = True
 
-jump_mask = np.array(jump_any)
+# -----------------------
+# jump_flag / interp_flag from cleaned data
+#  (stored optionally inside npz)
+# -----------------------
+jump_mask  = np.zeros(N, dtype=bool)
 interp_mask = np.zeros(N, dtype=bool)
-for k in names:
-    interp_mask |= ((~np.isfinite(arr_pre[k]).all(axis=1)) &
-                    ( np.isfinite(arr[k]).all(axis=1)))
 
-# open video
+if "jump_any" in data:
+    jump_mask = data["jump_any"].astype(bool)
+if "interp_any" in data:
+    interp_mask = data["interp_any"].astype(bool)
+
+# -----------------------
+# Open video
+# -----------------------
 cap = cv2.VideoCapture(video_in)
+if not cap.isOpened():
+    raise RuntimeError("Cannot open video: " + video_in)
+
 W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -333,39 +363,47 @@ out = cv2.VideoWriter(overlay_out, fourcc, fps, (W, H))
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 
-def draw_skeleton_clean(img, frame_idx):
+def draw_clean_skel(vis, f):
     pts = {
-        "nose": arr["nose"][frame_idx],
-        "LS": arr["LS"][frame_idx],
-        "RS": arr["RS"][frame_idx],
-        "LH": arr["LH"][frame_idx],
-        "RH": arr["RH"][frame_idx],
+        "nose": nose[f],
+        "LS": LS[f],
+        "RS": RS[f],
+        "LH": LH[f],
+        "RH": RH[f],
     }
-    def ok(p): return np.isfinite(p).all()
+    def ok(p):
+        return np.isfinite(p).all()
 
+    # points
     for p in pts.values():
         if ok(p):
-            cv2.circle(img, (int(p[0]), int(p[1])), 3, (0,255,255), -1)
+            cv2.circle(vis, (int(p[0]), int(p[1])), 3, (0,255,255), -1)
 
+    # shoulder line
     if ok(pts["LS"]) and ok(pts["RS"]):
-        cv2.line(img, (int(pts["LS"][0]),int(pts["LS"][1])),
+        cv2.line(vis, (int(pts["LS"][0]),int(pts["LS"][1])),
                       (int(pts["RS"][0]),int(pts["RS"][1])),
                  (0,255,255), 2)
 
+    # hip line
     if ok(pts["LH"]) and ok(pts["RH"]):
-        cv2.line(img, (int(pts["LH"][0]),int(pts["LH"][1])),
+        cv2.line(vis, (int(pts["LH"][0]),int(pts["LH"][1])),
                       (int(pts["RH"][0]),int(pts["RH"][1])),
                  (0,255,255), 2)
 
-# frame loop
+
+# -----------------------
+# Frame loop
+# -----------------------
 f = 0
 while True:
     ret, frame = cap.read()
     if not ret or f >= N:
         break
+
     vis = frame.copy()
 
-    # border color
+    # Color borders
     if missing_mask[f]:
         cv2.rectangle(vis, (0,0), (W-1,H-1), (200,0,200), 8)  # purple
     elif jump_mask[f]:
@@ -373,10 +411,10 @@ while True:
     elif interp_mask[f]:
         cv2.rectangle(vis, (0,0), (W-1,H-1), (0,255,255), 8)  # yellow
 
-    draw_skeleton_clean(vis, f)
+    draw_clean_skel(vis, f)
 
-    cv2.putText(vis, f"t={time_all[f]:.2f}s  frame={f}", (12,28),
-                FONT, 0.6, (255,255,255), 2, cv2.LINE_AA)
+    cv2.putText(vis, f"t={time_all[f]:.2f}s  frame={f}",
+                (12,28), FONT, 0.6, (255,255,255), 2, cv2.LINE_AA)
 
     out.write(vis)
     f += 1
@@ -384,7 +422,9 @@ while True:
 cap.release()
 out.release()
 
-# FFmpeg → QuickTime-safe
+# -----------------------
+# Make QuickTime-safe
+# -----------------------
 os.system(
     f"ffmpeg -y -i {overlay_out} -vcodec libx264 -pix_fmt yuv420p "
     f"-profile:v baseline -level 3.0 -movflags +faststart {overlay_qt}"
