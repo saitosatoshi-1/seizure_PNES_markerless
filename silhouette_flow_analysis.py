@@ -139,18 +139,48 @@ time_all = dat["time_all"]
 LS, RS   = dat["LS"], dat["RS"]
 LH, RH   = dat["LH"], dat["RH"]
 
-# Optional: original frame size stored in NPZ (for rescaling)
-refW = dat["frame_w"].item() if "frame_w" in dat.files else (
-       dat["ref_w"].item()   if "ref_w"   in dat.files else W)
-refH = dat["frame_h"].item() if "frame_h" in dat.files else (
-       dat["ref_h"].item()   if "ref_h"   in dat.files else H)
+# =========================
+# Check available resolution keys
+# =========================
+print("[NPZ] keys:", dat.files)
 
-# Rescale skeleton coordinates if NPZ was generated at a different resolution
+has_frame_w = "frame_w" in dat.files
+has_ref_w   = "ref_w"   in dat.files
+has_frame_h = "frame_h" in dat.files
+has_ref_h   = "ref_h"   in dat.files
+
+print(f"[NPZ] frame_w: {has_frame_w}, ref_w: {has_ref_w}")
+print(f"[NPZ] frame_h: {has_frame_h}, ref_h: {has_ref_h}")
+
+# =========================
+# Determine reference resolution
+# =========================
+if has_frame_w and has_frame_h:
+    refW = dat["frame_w"].item()
+    refH = dat["frame_h"].item()
+    print(f"[NPZ] Using frame_w/frame_h: ({refW}, {refH})")
+
+elif has_ref_w and has_ref_h:
+    refW = dat["ref_w"].item()
+    refH = dat["ref_h"].item()
+    print(f"[NPZ] Using ref_w/ref_h: ({refW}, {refH})")
+
+else:
+    # fallback: assume NPZ was generated with current video size
+    refW, refH = W, H
+    print(f"[NPZ] No resolution info found — using current video size ({W}, {H})")
+
+# =========================
+# Rescale skeleton coordinates if needed
+# =========================
 if (refW, refH) != (W, H):
+    print(f"[NPZ] Rescaling skeleton: ({refW}, {refH}) → ({W}, {H})")
     sx, sy = W / refW, H / refH
     for A in (LS, RS, LH, RH):
         A[:, 0] *= sx
         A[:, 1] *= sy
+else:
+    print("[NPZ] No rescaling needed.")
 
 hip_mid      = (LH + RH) / 2.0
 shoulder_mid = (LS + RS) / 2.0
@@ -159,6 +189,11 @@ hip_w_med      = float(np.nanmedian(np.linalg.norm(RH - LH, axis=1)))
 
 # =========================
 # Load gate_config.json (zones)
+#“gate_config.json に描かれている領域（ポリゴン）を、動画サイズのマスク画像に変換している”
+#priority（優先） → 患者である可能性が最も高い領域
+#allow（許可） → 患者が存在してよい領域
+#exclude（禁止） → 患者が絶対に存在しない領域（スタッフや機器）
+#この3つの領域を「画像と同じ大きさの2Dマップ」に変換する処理です。
 # =========================
 def _as_polys(obj):
     """
@@ -228,6 +263,7 @@ def load_gate_masks(json_path, W, H, refW=None, refH=None):
     exc_mask = np.zeros((H, W), np.uint8)
     for P in excl_list or []:
         P = scale_poly(P)
+        #OpenCVでポリゴン内部を1（True）で塗りつぶしてH×Wのマスク画像を作る。
         cv2.fillPoly(exc_mask, [P.astype(np.int32)], 1)
 
     return pri_mask.astype(bool), allow_mask.astype(bool), exc_mask.astype(bool)
@@ -236,14 +272,24 @@ priority_mask, allow_mask, exclude_mask = load_gate_masks(gate_json, W, H, refW,
 
 # =========================
 # Utility functions
+#人物シルエットの重心を計算
+#輪郭を描画
+#色を重ねて可視化
+#ヒートマップを重ねる
+#マスク同士の IoU（似ている度）を計算
+#allow / priority / exclude のゾーン判定
 # =========================
+
+#マスク領域の重心を返す
 def mcent(m):
     """Return centroid (x, y) of a boolean mask, or None if empty."""
+    #マスクmの中でTrueになっているピクセルを取り出す
     ys, xs = np.nonzero(m)
     if xs.size == 0:
         return None
     return float(xs.mean()), float(ys.mean())
 
+#マスクの輪郭を画像に描画
 def draw_cnt(img, m, col, th=2):
     """Draw contour(s) of a boolean mask."""
     if m is None or not m.any():
@@ -253,6 +299,7 @@ def draw_cnt(img, m, col, th=2):
     if cnts:
         cv2.drawContours(img, cnts, -1, col, th)
 
+#priority/allow/excludeの枠を描画
 def draw_poly_mask(img, mask, color, thickness=2):
     """Draw polygon outlines from a boolean mask (for zone visualization)."""
     if mask is None:
@@ -285,6 +332,7 @@ def heat_overlay(img, mag, m, a, pctl):
     ov[m] = (cmap[m] * a + img[m] * (1 - a)).astype(np.uint8)
     img[:] = ov
 
+#前のフレームのmaskと今の候補maskが似ているか判定
 def iou(a, b):
     """IoU of two boolean masks."""
     if a is None or b is None:
@@ -297,6 +345,7 @@ def clip_to_allow(m):
     """Force mask to stay inside the allow_mask (if defined)."""
     return np.logical_and(m, allow_mask) if allow_mask is not None else m
 
+#マスクの形が逸脱していないか?
 def is_ok_shape(m):
     """Basic sanity check on mask shape (area/height/aspect ratio)."""
     area = int(m.sum())
@@ -313,6 +362,7 @@ def is_ok_shape(m):
         return False
     return True
 
+#priority/allow/noneを判定
 def zone_of_mask(m):
     """Return which zone the mask overlaps: priority / allow / none."""
     if m is None:
@@ -335,6 +385,7 @@ def candidate_zone_bonus(m):
 
 # =========================
 # Skeleton torso capsule ROI
+#肩と股関節の位置から胴体カプセル領域を作る
 # =========================
 def capsule_mask_from_pose(
     W, H,
@@ -373,6 +424,8 @@ def capsule_mask_from_pose(
     M = (canvas > 0)
     return np.logical_and(M, allow_mask) if allow_mask is not None else M
 
+#この関数は「候補マスクが患者の胴体 ROI のどれだけを占めているか」を返す。
+#値が大きいほど、その候補は本物の患者である可能性が高い。
 def overlap_ratio(mask_roi, mask_cand):
     """Overlap ratio = intersection / candidate area."""
     if mask_roi is None or mask_cand is None:
@@ -380,6 +433,7 @@ def overlap_ratio(mask_roi, mask_cand):
     inter = np.logical_and(mask_roi, mask_cand).sum()
     denom = mask_cand.sum() + 1e-6
     return float(inter) / float(denom)
+
 
 # =========================
 # Candidate selection (IoU + distance + anchor + ROI + zone hysteresis)
@@ -505,6 +559,10 @@ def select_mask(prev_m, prev_zone, cand_list, t_sec, anchor_xy, sticky, zone_sti
 
 # =========================
 # 1D cleaning helper (clip + interpolate + small median filter)
+#外れ値除去（percentile clip）
+#欠損補間（interpolation）
+#なめらかに（median filter）
+#統計情報を返す**
 # =========================
 def series_clip_interp_medfilt(x, fps_video,
                                p1=1, p99=99,
@@ -550,7 +608,7 @@ def series_clip_interp_medfilt(x, fps_video,
 
     n_nan_after = np.count_nonzero(~np.isfinite(out))
 
-    # very small median filter (optional)
+    # very small median filter (optional) 3点窓
     if median_win_fr >= 2 and n >= 3:
         med = out.copy()
         med[1:-1] = np.nanmedian(
@@ -570,6 +628,10 @@ def series_clip_interp_medfilt(x, fps_video,
 
 # =========================
 # Main loop: segmentation + flow + split upper/lower
+#1.	YOLO segmentation で「人物シルエット候補」を抽出
+#2.	Skeleton（肩・股関節）と Gate（priority/allow/exclude）を使って「本物の人」だけを選択
+#3.	選ばれた人物の上半身・下半身ごとに光フロー（運動量）を計算して記録
+
 # =========================
 frames = []
 t_secs = []
@@ -715,6 +777,9 @@ while True:
         draw_cnt(frame, sel_lower, (255, 255, 255), 2)
 
     # optical flow (Farneback)
+    #fa = 全身の運動量
+	#fu = 上半身の運動量
+	#fl = 下半身の運動量
     fa = fu = fl = np.nan
     ux_all = uy_all = np.nan
     ux_u = uy_u = np.nan
