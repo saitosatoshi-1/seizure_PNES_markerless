@@ -88,12 +88,12 @@ ANCHOR_RADIUS_RATIO  = 0.10  # how close to hip-anchor (relative to image diagon
 ANCHOR_CENT_MAX_RATIO = 0.12
 
 # Stickiness & shape constraints for segmentation selection
-IOU_KEEP         = 0.35
-DIST_KEEP_RATIO  = 0.20
-IOU_SWITCH       = 0.15
-DIST_SWITCH_RATIO = 0.35
-STICKY_FRAMES    = 8
-ZONE_STICKY_FRAMES = 12
+IOU_KEEP         = 0.35    #前フレームとIoU（重なり）が35%以上 → 同じ人物とみなして保持
+DIST_KEEP_RATIO  = 0.20    #中心の移動距離が画面対角の20%以内 → 同じ人物として継続
+IOU_SWITCH       = 0.15    #距離が大きい → 別の物体に切り替えるべき
+DIST_SWITCH_RATIO = 0.35   #中心距離が35%を超える → 大きく移動しすぎ → 選択を切り替え
+STICKY_FRAMES    = 8       #最大8フレームは「同じ人物」と粘る。
+ZONE_STICKY_FRAMES = 12    #ゾーン（優先領域）を８フレーム以上維持しやすくする。
 
 MIN_AREA_RATIO   = 0.005   # min mask area relative to frame
 MIN_HEIGHT_RATIO = 0.15    # min mask height relative to frame
@@ -117,7 +117,7 @@ cap = cv2.VideoCapture(video_path)
 if not cap.isOpened():
     raise RuntimeError(f'Failed to open video: {video_path}')
 
-fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+fps = cap.get(cv2.CAP_PROP_FPS)
 W   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 H   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
