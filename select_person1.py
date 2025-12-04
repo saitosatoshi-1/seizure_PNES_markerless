@@ -86,26 +86,13 @@ def select_person1_at_best_bed(
     pose_model_path: str = "yolo11l-pose.pt",
     conf: float = 0.2,
 ) -> None:
-    """
-    Select person1 at the best_bed frame and save PNG + JSON meta.
-
-    Parameters
-    ----------
-    video_path : str
-        Path to input silhouette video (e.g., QuickTime-safe MP4).
-    gate_json_path : str
-        Path to gate_config.json containing best_frame, bed_xyxy, bed_cxcy, gate_polygon, etc.
-    out_png : str
-        Path to save visualization PNG.
-    out_json : str
-        Path to save integrated meta JSON (bed + gate + person1).
-    pose_model_path : str, optional
-        YOLO pose model weight file path.
-    conf : float, optional
-        Confidence threshold for YOLO pose detection.
-    """
 
     # 1) Load gate / bed configuration
+	# gate_cfg から以下を取り出す：
+	# best_frame →「ベッド位置が一番きれいに見えるフレーム番号」
+	# bed_xyxy → ベッド矩形（x1, y1, x2, y2）
+	# bed_cxcy → ベッド中心座標
+	# gate_polygon → ベッド周囲の Gate ポリゴン（患者がいてほしい領域）
     gate_json_path = str(gate_json_path)
     with open(gate_json_path, "r") as f:
         gate_cfg = json.load(f)
@@ -115,7 +102,12 @@ def select_person1_at_best_bed(
     bed_cx, bed_cy = map(float, gate_cfg["bed_cxcy"])
     gate_points = np.array(gate_cfg["gate_polygon"], dtype=np.float32)  # (N, 2)
 
+    
     # 2) Read best_frame from video
+    # 動画を VideoCapture で開く
+	# best_frame_idx にシークして、そのフレームを1枚読む
+	# 読めなければエラー
+	# フレームのサイズ H, W を取得 → 「ベッドが一番きれいに写っているフレーム」を1枚だけ取り出す。
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open video: {video_path}")
@@ -129,13 +121,24 @@ def select_person1_at_best_bed(
 
     H, W = frame.shape[:2]
 
+    
     # 3) YOLO pose detection
+    # YOLO pose モデルをロード
+	# frame に対して推論
+	# res が、このフレーム内の keypoints / bbox 情報を持つ結果オブジェクト
     pose_model = YOLO(pose_model_path)
     res = pose_model.predict(frame, verbose=False, conf=conf)[0]
 
     persons = []
 
+
     # Preferred: use keypoints center
+    # res.keypoints.xy : (人数 N, キーポイント数 K, 2) の配列
+	# 各人物 i について：
+	# NaN を除外した有効な keypoints だけを使う
+	# その平均位置 (cx, cy) を取る
+	# {"idx": i, "cx": ..., "cy": ...} として persons に追加 → 「人物 i の重心（おおざっぱな体の中心）」 を計算している。
+
     if res.keypoints is not None and res.keypoints.xy is not None:
         kps = res.keypoints.xy.cpu().numpy()  # shape: (N, K, 2)
         for i in range(kps.shape[0]):
@@ -159,6 +162,11 @@ def select_person1_at_best_bed(
         raise RuntimeError("No person detected in the best_frame.")
 
     # 4) Restrict to inside gate polygon if possible
+    # inside_gate(x, y, gate_points)（別関数）を使って、
+	# 体中心が Gate ポリゴンの中にある人物だけを候補にする
+	# （Gate内=ベッドの上 or その周囲→患者らしい場所）
+	# Gate 内に誰もいなければ、仕方ないので全員を候補に使う
+
     candidates = [
         p for p in persons if inside_gate(p["cx"], p["cy"], gate_points)
     ]
@@ -166,7 +174,13 @@ def select_person1_at_best_bed(
         # fallback: use all persons
         candidates = persons
 
+
     # 5) Among candidates, select nearest to bed center = person1
+    # 各候補 p について：
+	# ベッド中心 (bed_cx, bed_cy) との距離 dist を計算
+	# ベッド中心に一番近い人物 を person1 とする
+	# その idx（YOLO 内の人物インデックス）を pidx として保存 → **「Gate 内でベッドに一番近い人 = ベッドの患者本人」**というルール。
+
     for p in candidates:
         dx = p["cx"] - bed_cx
         dy = p["cy"] - bed_cy
@@ -174,6 +188,7 @@ def select_person1_at_best_bed(
 
     person1 = min(candidates, key=lambda d: d["dist"])
     pidx = int(person1["idx"])
+
 
     # 6) Visualization
     vis = frame.copy()
@@ -265,19 +280,6 @@ def select_person1_at_best_bed(
         cv2.LINE_AA,
     )
 
-    # 7) Save PNG
-    out_png = str(out_png)
-    Path(out_png).parent.mkdir(parents=True, exist_ok=True)
-    ok = cv2.imwrite(out_png, vis)
-    print(
-        f"[person1] frame={best_frame_idx} "
-        f"bed_cxcy=({bed_cx:.1f},{bed_cy:.1f}) "
-        f"bed_xyxy=({bx1:.1f},{by1:.1f},{bx2:.1f},{by2:.1f}) | "
-        f"person1_idx={pidx} "
-        f"person1_cxcy=({person1['cx']:.1f},{person1['cy']:.1f}) "
-        f"dist_px={person1['dist']:.1f}  PNG:{ok}"
-    )
-
     # 8) Save integrated meta JSON (bed + gate + person1)
     meta = {
         "best_frame": best_frame_idx,
@@ -303,61 +305,3 @@ def select_person1_at_best_bed(
     print("[Info] Saved meta JSON:", out_json)
 
 
-# -------------------------------------------------------------------------
-# CLI entry point
-# -------------------------------------------------------------------------
-def main():
-    parser = argparse.ArgumentParser(
-        description="Select person1 at best_bed frame using YOLO pose + gate_config.json"
-    )
-    parser.add_argument(
-        "--video",
-        type=str,
-        default="/content/FBTCS_silhouette_qt.mp4",
-        help="Input silhouette video path",
-    )
-    parser.add_argument(
-        "--gate-json",
-        type=str,
-        default="/content/gate_config.json",
-        help="gate_config.json path",
-    )
-    parser.add_argument(
-        "--out-png",
-        type=str,
-        default="/content/person1_at_bestbed.png",
-        help="Output PNG path",
-    )
-    parser.add_argument(
-        "--out-json",
-        type=str,
-        default="/content/bed_best.json",
-        help="Output meta JSON path",
-    )
-    parser.add_argument(
-        "--pose-model",
-        type=str,
-        default="yolo11l-pose.pt",
-        help="YOLO pose model weights path",
-    )
-    parser.add_argument(
-        "--conf",
-        type=float,
-        default=0.2,
-        help="Confidence threshold for YOLO pose detection",
-    )
-
-    args = parser.parse_args()
-
-    select_person1_at_best_bed(
-        video_path=args.video,
-        gate_json_path=args.gate_json,
-        out_png=args.out_png,
-        out_json=args.out_json,
-        pose_model_path=args.pose_model,
-        conf=args.conf,
-    )
-
-
-if __name__ == "__main__":
-    main()
