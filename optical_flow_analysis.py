@@ -18,7 +18,6 @@
 # Dependencies:
 #   OpenCV, NumPy, pandas
 #
-# Author: Satoshi Saito
 # =============================================================
 
 import cv2, numpy as np, pandas as pd
@@ -41,7 +40,6 @@ DRAW_SPIKE = True     # draw ROI in red if spike detected
 # =============================================================
 # ROI polygon (priority zone from upstream step or manual input)
 # =============================================================
-print("=== Using upstream priority_coords as ROI ===")
 
 ROI_POINTS = np.array([
     [556, 164],
@@ -50,11 +48,10 @@ ROI_POINTS = np.array([
     [650, 448]
 ], dtype=np.float32)
 
-print("ROI_POINTS:\n", ROI_POINTS)
 
 # =============================================================
 # Load skeleton (person1 tracking)
-#   kpts_raw : (T, 17, 3?) pose keypoints
+#   kpts_raw : pose keypoints
 #   time_all : timestamp for each frame of skeleton
 # =============================================================
 dat = np.load(npz_path, allow_pickle=True)
@@ -73,7 +70,7 @@ RH   = 12
 # Video IO
 # =============================================================
 cap = cv2.VideoCapture(video_path)
-fps = cap.get(cv2.CAP_PROP_FPS) or fps_npz
+fps = cap.get(cv2.CAP_PROP_FPS)
 W   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 H   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
@@ -86,6 +83,11 @@ out = cv2.VideoWriter(
 
 # =============================================================
 # ROI mask
+# 中身：すべて 0
+# 型：uint8（0〜255 の画素値を持つ画像として扱いやすい）
+# 真っ黒（0）の画像を作る
+# ROIを1でぬりつぶす (fillpoly)
+# ROI部分をtrueにする
 # =============================================================
 mask = np.zeros((H, W), np.uint8)
 cv2.fillPoly(mask, [ROI_POINTS.astype(np.int32)], 1)
@@ -104,6 +106,9 @@ prev_vy = None
 
 # =============================================================
 # Main loop
+# 動画のフレームを1枚ずつ読み込み、カラー → グレースケールに変換して処理する
+# frame：読み込んだ画像（1フレーム分）
+# ret：成功したかどうか（True or False）
 # =============================================================
 while True:
     ret, frame = cap.read()
@@ -114,6 +119,9 @@ while True:
 
     # ---------------------------------------------------------
     # Match skeleton timestamp to video time
+    # 動画フレームと skeleton フレームを「時刻」で同期させる処理
+    # SkeletonはYOLO推論ベースなので, fps時刻とずれがある
+    # そのフレームに対応する肩・股関節座標（kp）を取り出す
     # ---------------------------------------------------------
     t_sec = frame_idx / fps
     ai = int(np.clip(np.searchsorted(time_all, t_sec, 'right') - 1,
@@ -124,6 +132,7 @@ while True:
     # Derive body coordinate axes (vx, vy)
     # vx: shoulder axis
     # vy: torso axis (shoulder_mid → hip_mid)
+　　# LS: 左肩, RS: 右肩, LH: 左股関節, RH: 右股関節
     # ---------------------------------------------------------
     LS_xy = kp[LS, :2]
     RS_xy = kp[RS, :2]
@@ -132,15 +141,18 @@ while True:
 
     axes_valid = False
 
+    # NaNが無いか確認
     if (np.all(np.isfinite(LS_xy)) and np.all(np.isfinite(RS_xy)) and
         np.all(np.isfinite(LH_xy)) and np.all(np.isfinite(RH_xy))):
 
+        # 肩の中点・股関節の中点
         shoulder_mid = (LS_xy + RS_xy) / 2.0
         hip_mid      = (LH_xy + RH_xy) / 2.0
 
         vx = RS_xy - LS_xy
         vy = hip_mid - shoulder_mid
 
+        # ベクトルの正規化 (単位ベクトルにする)
         nx = np.linalg.norm(vx)
         ny = np.linalg.norm(vy)
 
@@ -159,13 +171,20 @@ while True:
 
     # ---------------------------------------------------------
     # Optical flow (Farnebäck)
+    # 0.5: ピラミッドスケール（multi-scale 処理の縮小比）
+    # 3: ピラミッドレベル数
+    # 15: ウィンドウサイズ（周囲 15×15 ピクセルを参照）
+    # 3: イテレーション数
+    # 5: ポリノミアル展開近傍サイズ
+    # 1.2 平滑化の係数
+    # 0: オプションフラグ
     # ---------------------------------------------------------
     if flow_prev is not None:
         flow = cv2.calcOpticalFlowFarneback(
             flow_prev, gray, None,
             0.5, 3, 15, 3, 5, 1.2, 0
         )
-
+        # x方向とy方向の速度場
         fx = flow[...,0]
         fy = flow[...,1]
 
@@ -173,16 +192,23 @@ while True:
         # Project optical flow into body axes
         # fx_body : movement along shoulder axis
         # fy_body : movement along torso axis
+        # 画像の座標系 → 身体の座標系に変換される
+        # 光フローの動きが 身体の左右方向・上下方向に分解される
         # -----------------------------------------------------
         if axes_valid:
+            # 身体座標系の単位ベクトルを取り出す
             vx_x, vx_y = vx
             vy_x, vy_y = vy
 
+            # 光フローの身体軸への投射
+            # 光フローと肩軸ベクトルの内積
             fx_body = fx * vx_x + fy * vx_y
             fy_body = fx * vy_x + fy * vy_y
 
+            # 身体軸での合成ベクトル
             mag_body = cv2.magnitude(fx_body, fy_body)
 
+            # ROI内だけの平均値を計算
             vx_mean  = float(np.mean(fx_body[mask_bool]))
             vy_mean  = float(np.mean(fy_body[mask_bool]))
             mag_mean = float(np.mean(mag_body[mask_bool]))
