@@ -215,17 +215,29 @@ while True:
 
             # -------------------------------------------------
             # Visualization (HSV optical flow)
+            # arctan2でベクトルの向きを角度にする
+            # 身体方向ベースの動きの向きを色で表現
+            # H (色): 方向, S (彩度): 1-255, V (明度): 強さ(mag)
+            # 右 (0度): 赤, 上 (90度): 緑, 左 (180度): 青, 下 (270度): 紫
             # -------------------------------------------------
             ang_body = np.arctan2(fy_body, fx_body)
             hsv = np.zeros((H,W,3), np.uint8)
             hsv[...,1] = 255
+            
+            # 色
             hsv[...,0] = ((ang_body + np.pi) / (2*np.pi) * 180).astype(np.uint8)
+            
+            # 明度 (動きの強さ), min-max正規化して0-255レンジに.
             hsv[...,2] = cv2.normalize(mag_body, None, 0,255, cv2.NORM_MINMAX).astype(np.uint8)
 
+            # HSVがらBGRに変換
             flow_color = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+
+            # ROIの部分だけ色を反映
             masked_flow = np.zeros_like(flow_color)
             masked_flow[mask_bool] = flow_color[mask_bool]
 
+            # 元画像 35%, 光フロー可視化 65%
             overlay = cv2.addWeighted(frame, 0.35, masked_flow, 0.65, 0)
 
         else:
@@ -241,6 +253,8 @@ while True:
 
     # ---------------------------------------------------------
     # MAD-based spike detection
+    # アーチファクトの動きを除外
+　　 # spike_flag: 0スパイクなし, 1スパイクあり
     # ---------------------------------------------------------
     spike_flag = 0
     mag_hist.append(mag_mean)
